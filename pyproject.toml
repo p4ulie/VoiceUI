@@ -1,0 +1,13 @@
+[project]
+name = "voiceui"
+version = "0.1.0"
+description = "Local voice chat with LLMs (llama.cpp + faster-whisper + Piper)"
+requires-python = ">=3.14"
+dependencies = [
+    "fastapi>=0.139",
+    "uvicorn[standard]>=0.51",
+    "httpx>=0.28",
+    "faster-whisper>=1.2",
+    "piper-tts>=1.4",
+    "python-multipart>=0.0.32",
+]

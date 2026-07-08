@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VoiceUI</title>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
+<!-- vad + its onnxruntime-web@1.14.0 are vendored in /static (see fetch-assets.sh) -->
+<script src="/static/ort.min.js"></script>
+<script src="/static/bundle.min.js"></script>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 16px/1.5 system-ui, sans-serif; max-width: 780px; margin: 0 auto; padding: 1rem; }
+  #log { display: flex; flex-direction: column; gap: .75rem; margin-bottom: 1rem; }
+  .msg { padding: .6rem .9rem; border-radius: .8rem; max-width: 85%; }
+  .user { align-self: flex-end; background: #2563eb; color: #fff; }
+  .assistant { align-self: flex-start; background: rgba(127,127,127,.15); }
+  .assistant pre { overflow-x: auto; }
+  #bar { display: flex; gap: .5rem; align-items: center; }
+  #text { flex: 1; padding: .6rem; border-radius: .6rem; border: 1px solid #8888; font: inherit; }
+  button { padding: .6rem .9rem; border-radius: .6rem; border: 0; cursor: pointer; font: inherit; }
+  #mic.recording { background: #dc2626; color: #fff; }
+  #opts { display: flex; gap: 1rem; align-items: center; margin-bottom: .5rem; font-size: .9rem; }
+  #status { color: #888; font-size: .85rem; min-height: 1.2em; }
+</style>
+</head>
+<body>
+<h2>VoiceUI</h2>
+<div id="opts">
+  <label>Model: <select id="model"></select></label>
+  <label>Voice:
+    <select id="mode">
+      <option value="ptt">Push-to-talk</option>
+      <option value="vad">Hands-free</option>
+    </select>
+  </label>
+  <label><input type="checkbox" id="autotts" checked> Speak replies</label>
+  <span id="status"></span>
+</div>
+<div id="log"></div>
+<div id="bar">
+  <button id="mic" title="Hold to talk (or spacebar)">🎤</button>
+  <input id="text" placeholder="Type a message…" autofocus>
+  <button id="send">Send</button>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const log = $('#log'), status = $('#status');
+const messages = [];
+let vadInst = null, ttsAudio = null;
+
+function addMsg(role, text = '') {
+  const el = document.createElement('div');
+  el.className = 'msg ' + role;
+  log.appendChild(el);
+  render(el, role, text);
+  log.scrollIntoView({ block: 'end' });
+  return el;
+}
+function render(el, role, text) {
+  if (role === 'assistant') el.innerHTML = DOMPurify.sanitize(marked.parse(text));
+  else el.textContent = text;
+  log.scrollIntoView({ block: 'end' });
+}
+
+async function send(text) {
+  text = text.trim();
+  if (!text) return;
+  addMsg('user', text);
+  messages.push({ role: 'user', content: text });
+  const el = addMsg('assistant', '');
+  let reply = '';
+  const res = await fetch('/chat', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: $('#model').value, messages }),
+  });
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '';
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let i;
+    while ((i = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+      if (!line.startsWith('data:')) continue;
+      const data = line.slice(5).trim();
+      if (data === '[DONE]') continue;
+      try {
+        const delta = JSON.parse(data).choices?.[0]?.delta?.content;
+        if (delta) { reply += delta; render(el, 'assistant', reply); }
+      } catch {}
+    }
+  }
+  messages.push({ role: 'assistant', content: reply });
+  // speak the rendered text, not the raw markdown (no "asterisk", "hash", backticks read aloud)
+  if ($('#autotts').checked && reply) await speak(el.textContent);
+}
+
+async function speak(text) {
+  if (vadInst) vadInst.pause();            // don't transcribe our own voice
+  try {
+    const res = await fetch('/tts', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+    });
+    const url = URL.createObjectURL(await res.blob());
+    ttsAudio = new Audio(url);
+    await ttsAudio.play();
+    await new Promise(r => ttsAudio.onended = r);
+    URL.revokeObjectURL(url);
+  } finally {
+    if (vadInst && $('#mode').value === 'vad') vadInst.start();
+  }
+}
+
+async function sttSend(blob) {
+  status.textContent = 'transcribing…';
+  const fd = new FormData();
+  fd.append('file', blob, 'audio');
+  const { text } = await (await fetch('/stt', { method: 'POST', body: fd })).json();
+  status.textContent = '';
+  if (text) await send(text);
+}
+
+// --- Push-to-talk (MediaRecorder) ---
+let rec = null, chunks = [];
+async function startPTT() {
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  rec = new MediaRecorder(stream);
+  chunks = [];
+  rec.ondataavailable = e => chunks.push(e.data);
+  rec.onstop = () => {
+    stream.getTracks().forEach(t => t.stop());
+    sttSend(new Blob(chunks, { type: rec.mimeType }));
+  };
+  rec.start();
+  $('#mic').classList.add('recording');
+}
+function stopPTT() {
+  if (rec && rec.state !== 'inactive') rec.stop();
+  $('#mic').classList.remove('recording');
+}
+
+// --- Hands-free (Silero VAD) ---
+function f32ToWav(f32, rate = 16000) {
+  const buf = new ArrayBuffer(44 + f32.length * 2);
+  const v = new DataView(buf);
+  const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  w(0, 'RIFF'); v.setUint32(4, 36 + f32.length * 2, true); w(8, 'WAVE');
+  w(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  w(36, 'data'); v.setUint32(40, f32.length * 2, true);
+  for (let i = 0; i < f32.length; i++) {
+    const s = Math.max(-1, Math.min(1, f32[i]));
+    v.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return new Blob([buf], { type: 'audio/wav' });
+}
+
+async function enableVAD() {
+  if (!vadInst) {
+    status.textContent = 'loading VAD…';
+    try {
+      if (typeof vad === 'undefined') throw new Error('vad library did not load (CDN blocked?)');
+      vadInst = await vad.MicVAD.new({
+        baseAssetPath: '/static/',
+        onnxWASMBasePath: '/static/',
+        onSpeechEnd: audio => sttSend(f32ToWav(audio)),
+      });
+    } catch (e) {
+      console.error('VAD init failed:', e);
+      status.textContent = 'VAD failed: ' + e.message;
+      $('#mode').value = 'ptt'; $('#mic').style.display = '';
+      return;
+    }
+    status.textContent = 'listening…';
+  }
+  vadInst.start();
+}
+
+$('#mode').onchange = e => {
+  if (e.target.value === 'vad') { $('#mic').style.display = 'none'; enableVAD(); }
+  else { $('#mic').style.display = ''; if (vadInst) vadInst.pause(); }
+};
+
+const mic = $('#mic');
+mic.addEventListener('pointerdown', e => { e.preventDefault(); startPTT(); });
+mic.addEventListener('pointerup', stopPTT);
+mic.addEventListener('pointerleave', stopPTT);
+
+document.addEventListener('keydown', e => {
+  if (e.code === 'Space' && document.activeElement !== $('#text') && !rec) { e.preventDefault(); startPTT(); }
+});
+document.addEventListener('keyup', e => { if (e.code === 'Space') stopPTT(); });
+
+$('#send').onclick = () => { const t = $('#text').value; $('#text').value = ''; send(t); };
+$('#text').addEventListener('keydown', e => { if (e.key === 'Enter') $('#send').click(); });
+
+const DEFAULT_MODEL = 'gemma-4-E4B-it-Q4_K_M';
+fetch('/models').then(r => r.json()).then(list => {
+  $('#model').innerHTML = list.map(m => `<option>${m}</option>`).join('');
+  if (list.includes(DEFAULT_MODEL)) $('#model').value = DEFAULT_MODEL;
+});
+</script>
+</body>
+</html>
