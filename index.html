@@ -17,6 +17,10 @@
   .user { align-self: flex-end; background: #2563eb; color: #fff; }
   .assistant { align-self: flex-start; background: rgba(127,127,127,.15); }
   .assistant pre { overflow-x: auto; }
+  .thinking span { animation: blink 1.2s infinite both; }
+  .thinking span:nth-child(2) { animation-delay: .2s; }
+  .thinking span:nth-child(3) { animation-delay: .4s; }
+  @keyframes blink { 0%, 80%, 100% { opacity: .2 } 40% { opacity: 1 } }
   #bar { display: flex; gap: .5rem; align-items: center; }
   #text { flex: 1; padding: .6rem; border-radius: .6rem; border: 1px solid #8888; font: inherit; }
   button { padding: .6rem .9rem; border-radius: .6rem; border: 0; cursor: pointer; font: inherit; }
@@ -129,6 +133,7 @@ async function send(text) {
   addMsg('user', text);
   messages.push({ role: 'user', content: text });
   const el = addMsg('assistant', '');
+  el.innerHTML = '<span class="thinking"><span>●</span><span>●</span><span>●</span></span>';  // waiting for first token
   let reply = '';
   const gStart = performance.now();
   perf.genStart = gStart;
@@ -164,8 +169,9 @@ async function send(text) {
       }
     }
   } catch (e) {
-    if (e.name === 'AbortError') return;   // superseded by a newer request
-    throw e;
+    if (e.name === 'AbortError') { if (!reply) el.remove(); return; }  // superseded -> drop the empty bubble
+    if (!reply) el.textContent = '⚠ ' + (e.message || 'request failed');
+    return;
   } finally {
     if (chatAbort === ac) chatAbort = null;
   }
