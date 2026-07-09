@@ -65,6 +65,7 @@
     <label>Stop word (halts speech) <input id="s_stop" placeholder="stop"></label>
     <label>Sleep after (seconds) <input id="s_timeout" type="number" min="0"></label>
   </div>
+  <label><input type="checkbox" id="s_keep"> Keep listening until stop word (ignore sleep timeout)</label>
   <label>System prompt <input id="s_system" placeholder="(none)"></label>
   <button id="s_save">Save</button>
   <span id="s_status" style="color:#888;font-size:.85rem"></span>
@@ -259,14 +260,17 @@ async function loadAck() {
 const playAck = () => ackUrl ? playAudio(ackUrl) : speak('Yes?');
 
 let audioCtx;
-function beep() {   // short WebAudio blip acknowledging the wake word
+function tone(freq, at, dur = 0.15, vol = 0.15) {
   audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+  const t = audioCtx.currentTime + at;
   const o = audioCtx.createOscillator(), g = audioCtx.createGain();
-  o.frequency.value = 880; o.connect(g); g.connect(audioCtx.destination);
-  g.gain.setValueAtTime(0.15, audioCtx.currentTime);
-  g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.15);
-  o.start(); o.stop(audioCtx.currentTime + 0.15);
+  o.frequency.value = freq; o.connect(g); g.connect(audioCtx.destination);
+  g.gain.setValueAtTime(vol, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  o.start(t); o.stop(t + dur);
 }
+const beep = () => tone(880, 0);                 // wake: single high blip
+const endTone = () => { tone(660, 0, 0.12); tone(440, 0.12, 0.14); };  // sleep: descending two-tone
 
 async function transcribe(blob) {
   status.textContent = 'transcribing…';
@@ -283,13 +287,17 @@ async function transcribe(blob) {
 // --- wake word gating (hands-free only) ---
 function wakeStatus() {
   if ($('#mode').value !== 'vad') { status.textContent = ''; return; }
-  const w = (cfg.wake_word || '').trim();
-  status.textContent = !w ? 'listening…' : awake ? '🟢 awake — listening' : `😴 say “${w}” to wake`;
+  const w = (cfg.wake_word || '').trim(), sw = (cfg.stop_word || '').trim();
+  if (!w) { status.textContent = 'listening…'; return; }
+  if (!awake) { status.textContent = `😴 say “${w}” to wake`; return; }
+  status.textContent = cfg.keep_listening && sw ? `🟢 listening — say “${sw}” to end` : '🟢 awake — listening';
 }
+function goSleep() { awake = false; clearTimeout(wakeTimer); wakeStatus(); endTone(); }  // end session + confirm
 function armSleep() {
   clearTimeout(wakeTimer);
+  if (cfg.keep_listening) return;                    // stay awake until the stop word
   const t = Number(cfg.wake_timeout) || 0;
-  if (t > 0) wakeTimer = setTimeout(() => { awake = false; wakeStatus(); }, t * 1000);
+  if (t > 0) wakeTimer = setTimeout(goSleep, t * 1000);
 }
 const reEsc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const trimEdges = s => s.replace(/^[\s,.:;!?-]+|[\s,.:;!?-]+$/g, '');
@@ -317,8 +325,13 @@ async function onVadSpeech(blob) {
   }
   const cmd = trimEdges(text).toLowerCase();
 
-  // stop word: "stop" or "computer stop" -> halt speech, stay awake, don't send to the LLM
-  if (sw && cmd === sw) { if (speaking) stopSpeak(); if (w) armSleep(); wakeStatus(); return; }
+  // stop word: "stop" or "computer stop" -> halt speech; in keep-listening mode it also ends the session
+  if (sw && cmd === sw) {
+    if (speaking) stopSpeak();
+    if (cfg.keep_listening) goSleep();     // stop word ends listening (with confirmation tone)
+    else if (w) armSleep();
+    wakeStatus(); return;
+  }
 
   if (justWoke && speaking) stopSpeak();        // barge-in with a real command: cut current speech
   if (w) armSleep();
@@ -451,6 +464,7 @@ $('#s_save').onclick = async () => {
     wake_word: $('#s_wake').value,
     stop_word: $('#s_stop').value,
     wake_timeout: Number($('#s_timeout').value),
+    keep_listening: $('#s_keep').checked,
     system_prompt: $('#s_system').value,
   });
   await loadModels();                          // URL/token may have changed
@@ -475,6 +489,7 @@ async function init() {
   $('#s_wake').value = cfg.wake_word;
   $('#s_stop').value = cfg.stop_word;
   $('#s_timeout').value = cfg.wake_timeout;
+  $('#s_keep').checked = cfg.keep_listening;
   $('#s_system').value = cfg.system_prompt;
   await Promise.all([loadModels(), loadVoices(), loadAck()]);
   warmModel();   // preload default model so the first turn isn't paying model-load time
