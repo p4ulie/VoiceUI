@@ -87,6 +87,7 @@ const messages = [];
 let cfg = {}, vadInst = null, ttsAudio = null;
 let awake = false, wakeTimer = null;
 let ttsQueue = [], ttsPlaying = false, ttsCancelled = false, ttsDone = true, ttsBuf = '';
+let chatAbort = null;
 
 // --- latency profiling: per-turn stage timings (ms) ---
 let perf = {};
@@ -120,6 +121,10 @@ function render(el, role, text) {
 async function send(text) {
   text = text.trim();
   if (!text) return;
+  if (chatAbort) chatAbort.abort();   // a new request cancels the in-flight one (stream + speech)
+  stopSpeak();
+  const ac = new AbortController();
+  chatAbort = ac;
   addMsg('user', text);
   messages.push({ role: 'user', content: text });
   const el = addMsg('assistant', '');
@@ -128,32 +133,40 @@ async function send(text) {
   perf.genStart = gStart;
   const speakReply = $('#autotts').checked;
   if (speakReply) { ttsBuf = ''; ttsDone = false; }   // start a fresh streamed-TTS run
-  const res = await fetch('/chat', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: $('#model').value, messages }),
-  });
-  const reader = res.body.getReader();
-  const dec = new TextDecoder();
-  let buf = '';
-  for (;;) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buf += dec.decode(value, { stream: true });
-    let i;
-    while ((i = buf.indexOf('\n')) >= 0) {
-      const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
-      if (!line.startsWith('data:')) continue;
-      const data = line.slice(5).trim();
-      if (data === '[DONE]') continue;
-      try {
-        const delta = JSON.parse(data).choices?.[0]?.delta?.content;
-        if (delta) {
-          if (perf.ttft == null) perf.ttft = performance.now() - gStart;  // time to first token
-          reply += delta; render(el, 'assistant', reply);
-          if (speakReply) { ttsBuf += delta; feedTTS(); }                 // speak sentences as they complete
-        }
-      } catch {}
+  try {
+    const res = await fetch('/chat', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: $('#model').value, messages }),
+      signal: ac.signal,
+    });
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+        if (!line.startsWith('data:')) continue;
+        const data = line.slice(5).trim();
+        if (data === '[DONE]') continue;
+        try {
+          const delta = JSON.parse(data).choices?.[0]?.delta?.content;
+          if (delta) {
+            if (perf.ttft == null) perf.ttft = performance.now() - gStart;  // time to first token
+            reply += delta; render(el, 'assistant', reply);
+            if (speakReply) { ttsBuf += delta; feedTTS(); }                 // speak sentences as they complete
+          }
+        } catch {}
+      }
     }
+  } catch (e) {
+    if (e.name === 'AbortError') return;   // superseded by a newer request
+    throw e;
+  } finally {
+    if (chatAbort === ac) chatAbort = null;
   }
   perf.gen = performance.now() - gStart;
   perf.chars = reply.length;
