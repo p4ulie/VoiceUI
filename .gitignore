@@ -5,3 +5,4 @@ models/
 static/
 *.wav
 uv.lock
+settings.json

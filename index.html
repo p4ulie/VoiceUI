@@ -21,8 +21,13 @@
   #text { flex: 1; padding: .6rem; border-radius: .6rem; border: 1px solid #8888; font: inherit; }
   button { padding: .6rem .9rem; border-radius: .6rem; border: 0; cursor: pointer; font: inherit; }
   #mic.recording { background: #dc2626; color: #fff; }
-  #opts { display: flex; gap: 1rem; align-items: center; margin-bottom: .5rem; font-size: .9rem; }
+  #opts { display: flex; gap: 1rem; align-items: center; margin-bottom: .5rem; font-size: .9rem; flex-wrap: wrap; }
   #status { color: #888; font-size: .85rem; min-height: 1.2em; }
+  #settings { display: none; border: 1px solid #8884; border-radius: .6rem; padding: 1rem; margin-bottom: 1rem; }
+  #settings label { display: block; margin: .5rem 0; }
+  #settings input, #settings select { width: 100%; padding: .4rem; border-radius: .4rem; border: 1px solid #8888; font: inherit; box-sizing: border-box; }
+  #settings .row { display: flex; gap: 1rem; }
+  #settings .row > label { flex: 1; }
 </style>
 </head>
 <body>
@@ -35,21 +40,66 @@
       <option value="vad">Hands-free</option>
     </select>
   </label>
-  <label><input type="checkbox" id="autotts" checked> Speak replies</label>
+  <label><input type="checkbox" id="autotts"> Speak replies</label>
+  <button id="gear" title="Settings">⚙</button>
   <span id="status"></span>
 </div>
+
+<div id="settings">
+  <label>LLM URL <input id="s_url" placeholder="http://localhost:8080/v1"></label>
+  <label>API token <input id="s_token" type="password" placeholder="(none)"></label>
+  <div class="row">
+    <label>STT model (Whisper)
+      <select id="s_whisper">
+        <option>tiny</option><option>tiny.en</option>
+        <option>base</option><option>base.en</option>
+        <option>small</option><option>small.en</option>
+        <option>medium</option><option>medium.en</option>
+        <option>large-v3</option>
+      </select>
+    </label>
+    <label>TTS voice (Piper) <select id="s_voice"></select></label>
+  </div>
+  <div class="row">
+    <label>Wake word (hands-free) <input id="s_wake" placeholder="computer"></label>
+    <label>Stop word (halts speech) <input id="s_stop" placeholder="stop"></label>
+    <label>Sleep after (seconds) <input id="s_timeout" type="number" min="0"></label>
+  </div>
+  <label>System prompt <input id="s_system" placeholder="(none)"></label>
+  <button id="s_save">Save</button>
+  <span id="s_status" style="color:#888;font-size:.85rem"></span>
+</div>
+
 <div id="log"></div>
 <div id="bar">
   <button id="mic" title="Hold to talk (or spacebar)">🎤</button>
   <input id="text" placeholder="Type a message…" autofocus>
   <button id="send">Send</button>
+  <button id="stop" title="Stop speaking" style="display:none">⏹</button>
 </div>
+<div id="perf" style="font-family:monospace;font-size:.8rem;color:#888;margin-top:.4rem"></div>
 
 <script>
 const $ = s => document.querySelector(s);
 const log = $('#log'), status = $('#status');
 const messages = [];
-let vadInst = null, ttsAudio = null;
+let cfg = {}, vadInst = null, ttsAudio = null;
+let awake = false, wakeTimer = null;
+
+// --- latency profiling: per-turn stage timings (ms) ---
+let perf = {};
+const ms = v => v == null ? '—' : v < 1000 ? `${Math.round(v)}ms` : `${(v / 1000).toFixed(1)}s`;
+function showPerf() {
+  const p = perf, tps = p.gen && p.chars ? ` (${Math.round(p.chars / 4 / (p.gen / 1000))} tok/s)` : '';
+  const parts = [];
+  if (p.stt != null) parts.push(`STT ${ms(p.stt)}${p.sttSrv != null ? ` [srv ${ms(p.sttSrv)}]` : ''}`);
+  if (p.ttft != null) parts.push(`TTFT ${ms(p.ttft)}`);
+  if (p.gen != null) parts.push(`gen ${ms(p.gen)}${tps}`);
+  if (p.tts != null) parts.push(`TTS ${ms(p.tts)}${p.ttsSrv != null ? ` [srv ${ms(p.ttsSrv)}]` : ''}`);
+  if (p.total != null) parts.push(`total ${ms(p.total)}`);
+  $('#perf').textContent = parts.join('  ·  ');
+  console.log('[latency]', p);
+}
 
 function addMsg(role, text = '') {
   const el = document.createElement('div');
@@ -72,6 +122,7 @@ async function send(text) {
   messages.push({ role: 'user', content: text });
   const el = addMsg('assistant', '');
   let reply = '';
+  const gStart = performance.now();
   const res = await fetch('/chat', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ model: $('#model').value, messages }),
@@ -91,51 +142,150 @@ async function send(text) {
       if (data === '[DONE]') continue;
       try {
         const delta = JSON.parse(data).choices?.[0]?.delta?.content;
-        if (delta) { reply += delta; render(el, 'assistant', reply); }
+        if (delta) {
+          if (perf.ttft == null) perf.ttft = performance.now() - gStart;  // time to first token
+          reply += delta; render(el, 'assistant', reply);
+        }
       } catch {}
     }
   }
+  perf.gen = performance.now() - gStart;
+  perf.chars = reply.length;
+  perf.total = performance.now() - (perf.t0 ?? gStart);   // whole turn (from speech-end for voice)
+  showPerf();
   messages.push({ role: 'assistant', content: reply });
-  // speak the rendered text, not the raw markdown (no "asterisk", "hash", backticks read aloud)
+  // speak the rendered text, not raw markdown (no "asterisk"/"hash"/backticks read aloud)
   if ($('#autotts').checked && reply) await speak(el.textContent);
 }
 
+async function playAudio(url) {
+  // With a wake word set, keep the VAD live during TTS so the wake word can barge in.
+  // Without one, pause to avoid transcribing our own voice into a feedback loop.
+  const bargeable = !!(cfg.wake_word || '').trim() && $('#mode').value === 'vad';
+  if (vadInst && !bargeable) vadInst.pause();
+  try {
+    ttsAudio = new Audio(url);
+    $('#stop').style.display = '';
+    await ttsAudio.play();
+    await new Promise(r => { ttsAudio.onended = r; ttsAudio.onpause = r; });  // stop() pauses -> resolves
+  } finally {
+    ttsAudio = null;
+    $('#stop').style.display = 'none';
+    if (vadInst && $('#mode').value === 'vad' && !bargeable) vadInst.start();
+  }
+}
 async function speak(text) {
-  if (vadInst) vadInst.pause();            // don't transcribe our own voice
+  const t0 = performance.now();
+  const res = await fetch('/tts', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text }),
+  });
+  const blob = await res.blob();
+  perf.tts = performance.now() - t0;                       // synth + transfer, before playback
+  perf.ttsSrv = +res.headers.get('X-TTS-ms') || null;
+  perf.total = performance.now() - (perf.t0 ?? t0);
+  showPerf();
+  const url = URL.createObjectURL(blob);
+  try { await playAudio(url); } finally { URL.revokeObjectURL(url); }
+}
+function stopSpeak() { if (ttsAudio) ttsAudio.pause(); }
+
+// Pre-render the wake acknowledgement once so it plays instantly (no per-wake synthesis, never hits the LLM).
+let ackUrl = null;
+async function loadAck() {
   try {
     const res = await fetch('/tts', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text }),
+      body: JSON.stringify({ text: 'Yes?' }),
     });
-    const url = URL.createObjectURL(await res.blob());
-    ttsAudio = new Audio(url);
-    await ttsAudio.play();
-    await new Promise(r => ttsAudio.onended = r);
-    URL.revokeObjectURL(url);
-  } finally {
-    if (vadInst && $('#mode').value === 'vad') vadInst.start();
-  }
+    if (ackUrl) URL.revokeObjectURL(ackUrl);
+    ackUrl = URL.createObjectURL(await res.blob());
+  } catch {}
+}
+const playAck = () => ackUrl ? playAudio(ackUrl) : speak('Yes?');
+
+let audioCtx;
+function beep() {   // short WebAudio blip acknowledging the wake word
+  audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+  const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+  o.frequency.value = 880; o.connect(g); g.connect(audioCtx.destination);
+  g.gain.setValueAtTime(0.15, audioCtx.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.15);
+  o.start(); o.stop(audioCtx.currentTime + 0.15);
 }
 
-async function sttSend(blob) {
+async function transcribe(blob) {
   status.textContent = 'transcribing…';
   const fd = new FormData();
   fd.append('file', blob, 'audio');
-  const { text } = await (await fetch('/stt', { method: 'POST', body: fd })).json();
+  const t0 = performance.now();
+  const res = await fetch('/stt', { method: 'POST', body: fd });
+  const { text } = await res.json();
+  perf = { stt: performance.now() - t0, sttSrv: +res.headers.get('X-STT-ms') || null, t0 };
   status.textContent = '';
-  if (text) await send(text);
+  return text;
 }
 
-// --- Push-to-talk (MediaRecorder) ---
+// --- wake word gating (hands-free only) ---
+function wakeStatus() {
+  if ($('#mode').value !== 'vad') { status.textContent = ''; return; }
+  const w = (cfg.wake_word || '').trim();
+  status.textContent = !w ? 'listening…' : awake ? '🟢 awake — listening' : `😴 say “${w}” to wake`;
+}
+function armSleep() {
+  clearTimeout(wakeTimer);
+  const t = Number(cfg.wake_timeout) || 0;
+  if (t > 0) wakeTimer = setTimeout(() => { awake = false; wakeStatus(); }, t * 1000);
+}
+const reEsc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const trimEdges = s => s.replace(/^[\s,.:;!?-]+|[\s,.:;!?-]+$/g, '');
+
+async function onVadSpeech(blob) {
+  let text = await transcribe(blob);
+  if (!text) return;
+  const w = (cfg.wake_word || '').trim().toLowerCase();
+  const sw = (cfg.stop_word || '').trim().toLowerCase();
+  const norm = trimEdges(text).toLowerCase();
+  const speaking = !!ttsAudio;
+  const startsWake = w && norm.startsWith(w);   // wake word must START the utterance to count as an address
+
+  // Gate: while asleep or speaking, ignore anything not addressed to us — except a bare stop word, which halts speech.
+  if (w && (speaking || !awake) && !startsWake) {
+    if (sw && norm === sw && speaking) stopSpeak();
+    if (!speaking) wakeStatus();
+    return;
+  }
+
+  const justWoke = startsWake && (!awake || speaking);
+  if (startsWake) {                             // strip the leading wake word -> the command
+    awake = true;
+    text = text.replace(new RegExp('^[\\s,.:;!?-]*' + reEsc(w) + '[\\s,.:;!?-]*', 'i'), '');
+  }
+  const cmd = trimEdges(text).toLowerCase();
+
+  // stop word: "stop" or "computer stop" -> halt speech, stay awake, don't send to the LLM
+  if (sw && cmd === sw) { if (speaking) stopSpeak(); if (w) armSleep(); wakeStatus(); return; }
+
+  if (justWoke && speaking) stopSpeak();        // barge-in with a real command: cut current speech
+  if (w) armSleep();
+  if (!cmd) { if (justWoke) await playAck(); wakeStatus(); return; }  // wake word alone -> acknowledge (cached, instant)
+  if (justWoke) beep();
+  wakeStatus();
+  await send(text);
+}
+
+// --- push-to-talk (MediaRecorder) — explicit, no wake gating ---
 let rec = null, chunks = [];
 async function startPTT() {
   const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
   rec = new MediaRecorder(stream);
   chunks = [];
   rec.ondataavailable = e => chunks.push(e.data);
-  rec.onstop = () => {
+  rec.onstop = async () => {
     stream.getTracks().forEach(t => t.stop());
-    sttSend(new Blob(chunks, { type: rec.mimeType }));
+    const text = await transcribe(new Blob(chunks, { type: rec.mimeType }));
+    rec = null;
+    if (text) send(text);
   };
   rec.start();
   $('#mic').classList.add('recording');
@@ -145,7 +295,7 @@ function stopPTT() {
   $('#mic').classList.remove('recording');
 }
 
-// --- Hands-free (Silero VAD) ---
+// --- hands-free (Silero VAD) ---
 function f32ToWav(f32, rate = 16000) {
   const buf = new ArrayBuffer(44 + f32.length * 2);
   const v = new DataView(buf);
@@ -165,11 +315,11 @@ async function enableVAD() {
   if (!vadInst) {
     status.textContent = 'loading VAD…';
     try {
-      if (typeof vad === 'undefined') throw new Error('vad library did not load (CDN blocked?)');
+      if (typeof vad === 'undefined') throw new Error('vad library did not load');
       vadInst = await vad.MicVAD.new({
         baseAssetPath: '/static/',
         onnxWASMBasePath: '/static/',
-        onSpeechEnd: audio => sttSend(f32ToWav(audio)),
+        onSpeechEnd: audio => onVadSpeech(f32ToWav(audio)),
       });
     } catch (e) {
       console.error('VAD init failed:', e);
@@ -177,34 +327,90 @@ async function enableVAD() {
       $('#mode').value = 'ptt'; $('#mic').style.display = '';
       return;
     }
-    status.textContent = 'listening…';
   }
+  awake = false;
   vadInst.start();
+  wakeStatus();
 }
 
 $('#mode').onchange = e => {
   if (e.target.value === 'vad') { $('#mic').style.display = 'none'; enableVAD(); }
-  else { $('#mic').style.display = ''; if (vadInst) vadInst.pause(); }
+  else { $('#mic').style.display = ''; if (vadInst) vadInst.pause(); status.textContent = ''; }
 };
 
 const mic = $('#mic');
 mic.addEventListener('pointerdown', e => { e.preventDefault(); startPTT(); });
 mic.addEventListener('pointerup', stopPTT);
 mic.addEventListener('pointerleave', stopPTT);
-
 document.addEventListener('keydown', e => {
   if (e.code === 'Space' && document.activeElement !== $('#text') && !rec) { e.preventDefault(); startPTT(); }
 });
 document.addEventListener('keyup', e => { if (e.code === 'Space') stopPTT(); });
 
-$('#send').onclick = () => { const t = $('#text').value; $('#text').value = ''; send(t); };
+$('#stop').onclick = stopSpeak;
+$('#send').onclick = () => { const t = $('#text').value; $('#text').value = ''; perf = {}; send(t); };
 $('#text').addEventListener('keydown', e => { if (e.key === 'Enter') $('#send').click(); });
+$('#model').onchange = () => saveSettings({ model: $('#model').value });
 
-const DEFAULT_MODEL = 'gemma-4-E4B-it-Q4_K_M';
-fetch('/models').then(r => r.json()).then(list => {
-  $('#model').innerHTML = list.map(m => `<option>${m}</option>`).join('');
-  if (list.includes(DEFAULT_MODEL)) $('#model').value = DEFAULT_MODEL;
-});
+// --- settings ---
+$('#gear').onclick = () => {
+  const s = $('#settings');
+  s.style.display = s.style.display === 'block' ? 'none' : 'block';
+};
+async function loadModels() {
+  const list = await (await fetch('/models')).json();
+  const want = cfg.model && list.includes(cfg.model) ? cfg.model
+    : list.includes('gemma-4-E4B-it-Q4_K_M') ? 'gemma-4-E4B-it-Q4_K_M' : list[0];
+  $('#model').innerHTML = list.map(m => `<option${m === want ? ' selected' : ''}>${m}</option>`).join('');
+}
+async function loadVoices() {
+  const list = await (await fetch('/voices')).json();
+  $('#s_voice').innerHTML = list.map(v => `<option${v === cfg.piper_voice ? ' selected' : ''}>${v}</option>`).join('');
+}
+async function saveSettings(patch) {
+  cfg = await (await fetch('/settings', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+  })).json();
+}
+$('#s_save').onclick = async () => {
+  $('#s_status').textContent = 'saving…';
+  await saveSettings({
+    llm_url: $('#s_url').value,
+    api_token: $('#s_token').value || '***',   // '***' = keep existing
+    whisper_model: $('#s_whisper').value,
+    piper_voice: $('#s_voice').value,
+    wake_word: $('#s_wake').value,
+    stop_word: $('#s_stop').value,
+    wake_timeout: Number($('#s_timeout').value),
+    system_prompt: $('#s_system').value,
+  });
+  await loadModels();                          // URL/token may have changed
+  loadAck();                                   // voice may have changed -> re-render the ack
+  $('#s_token').value = '';
+  $('#s_status').textContent = 'saved — testing connection…';
+  const res = await (await fetch('/test_llm', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: $('#model').value }),
+  })).json();
+  $('#s_status').style.color = res.ok ? '#16a34a' : '#dc2626';
+  $('#s_status').textContent = (res.ok ? '✓ ' : '✗ ') + res.detail;
+};
+
+async function init() {
+  cfg = await (await fetch('/settings')).json();
+  $('#autotts').checked = cfg.auto_tts;
+  $('#autotts').onchange = () => saveSettings({ auto_tts: $('#autotts').checked });
+  $('#s_url').value = cfg.llm_url;
+  $('#s_token').placeholder = cfg.api_token ? '(set — leave blank to keep)' : '(none)';
+  $('#s_whisper').value = cfg.whisper_model;
+  $('#s_wake').value = cfg.wake_word;
+  $('#s_stop').value = cfg.stop_word;
+  $('#s_timeout').value = cfg.wake_timeout;
+  $('#s_system').value = cfg.system_prompt;
+  await Promise.all([loadModels(), loadVoices(), loadAck()]);
+}
+init();
 </script>
 </body>
 </html>
