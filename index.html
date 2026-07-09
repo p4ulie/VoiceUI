@@ -85,6 +85,7 @@ const log = $('#log'), status = $('#status');
 const messages = [];
 let cfg = {}, vadInst = null, ttsAudio = null;
 let awake = false, wakeTimer = null;
+let ttsQueue = [], ttsPlaying = false, ttsCancelled = false, ttsDone = true, ttsBuf = '';
 
 // --- latency profiling: per-turn stage timings (ms) ---
 let perf = {};
@@ -123,6 +124,9 @@ async function send(text) {
   const el = addMsg('assistant', '');
   let reply = '';
   const gStart = performance.now();
+  perf.genStart = gStart;
+  const speakReply = $('#autotts').checked;
+  if (speakReply) { ttsBuf = ''; ttsDone = false; }   // start a fresh streamed-TTS run
   const res = await fetch('/chat', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ model: $('#model').value, messages }),
@@ -145,6 +149,7 @@ async function send(text) {
         if (delta) {
           if (perf.ttft == null) perf.ttft = performance.now() - gStart;  // time to first token
           reply += delta; render(el, 'assistant', reply);
+          if (speakReply) { ttsBuf += delta; feedTTS(); }                 // speak sentences as they complete
         }
       } catch {}
     }
@@ -154,8 +159,7 @@ async function send(text) {
   perf.total = performance.now() - (perf.t0 ?? gStart);   // whole turn (from speech-end for voice)
   showPerf();
   messages.push({ role: 'assistant', content: reply });
-  // speak the rendered text, not raw markdown (no "asterisk"/"hash"/backticks read aloud)
-  if ($('#autotts').checked && reply) await speak(el.textContent);
+  if (speakReply) { feedTTS(true); ttsDone = true; }       // flush the final partial sentence
 }
 
 async function playAudio(url) {
@@ -188,7 +192,57 @@ async function speak(text) {
   const url = URL.createObjectURL(blob);
   try { await playAudio(url); } finally { URL.revokeObjectURL(url); }
 }
-function stopSpeak() { if (ttsAudio) ttsAudio.pause(); }
+function stopSpeak() { ttsCancelled = true; ttsQueue = []; if (ttsAudio) ttsAudio.pause(); }
+
+// --- sentence-streamed TTS: synthesize & play the reply sentence-by-sentence as it generates ---
+function cleanForSpeech(s) {
+  return s.replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')  // links -> text
+          .replace(/[*_`#>~]/g, '')                  // md emphasis / code / heading / quote markers
+          .replace(/^\s*[-+]\s+/gm, '')              // list bullets
+          .replace(/\s+/g, ' ').trim();
+}
+function enqueueSentence(s) {
+  const clean = cleanForSpeech(s);
+  if (clean) { ttsQueue.push(clean); if (!ttsPlaying) playQueue(); }
+}
+function feedTTS(final = false) {   // pull complete sentences from the buffer, keep the incomplete tail
+  const re = /[.!?\n]+[\s"'")\]]*/g; let m, cut = 0;
+  while ((m = re.exec(ttsBuf))) { enqueueSentence(ttsBuf.slice(cut, re.lastIndex)); cut = re.lastIndex; }
+  ttsBuf = ttsBuf.slice(cut);
+  if (final && ttsBuf.trim()) { enqueueSentence(ttsBuf); ttsBuf = ''; }
+}
+async function playQueue() {
+  ttsPlaying = true; ttsCancelled = false;
+  const bargeable = !!(cfg.wake_word || '').trim() && $('#mode').value === 'vad';
+  if (vadInst && !bargeable) vadInst.pause();
+  $('#stop').style.display = '';
+  let first = true;
+  try {
+    while ((ttsQueue.length || !ttsDone) && !ttsCancelled) {
+      if (!ttsQueue.length) { await new Promise(r => setTimeout(r, 25)); continue; }  // await next sentence
+      const s = ttsQueue.shift();
+      const t0 = performance.now();
+      const res = await fetch('/tts', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: s }),
+      });
+      const blob = await res.blob();
+      if (first) {   // time-to-first-audio is the metric that matters with streaming
+        perf.tts = performance.now() - t0; perf.ttsSrv = +res.headers.get('X-TTS-ms') || null;
+        perf.ttfa = performance.now() - (perf.t0 ?? perf.genStart ?? t0); showPerf(); first = false;
+      }
+      if (ttsCancelled) break;
+      const url = URL.createObjectURL(blob);
+      ttsAudio = new Audio(url);
+      await ttsAudio.play();
+      await new Promise(r => { ttsAudio.onended = r; ttsAudio.onpause = r; });
+      URL.revokeObjectURL(url);
+    }
+  } finally {
+    ttsAudio = null; ttsPlaying = false; ttsQueue = [];
+    $('#stop').style.display = 'none';
+    if (vadInst && $('#mode').value === 'vad' && !bargeable) vadInst.start();
+  }
+}
 
 // Pre-render the wake acknowledgement once so it plays instantly (no per-wake synthesis, never hits the LLM).
 let ackUrl = null;
@@ -246,7 +300,7 @@ async function onVadSpeech(blob) {
   const w = (cfg.wake_word || '').trim().toLowerCase();
   const sw = (cfg.stop_word || '').trim().toLowerCase();
   const norm = trimEdges(text).toLowerCase();
-  const speaking = !!ttsAudio;
+  const speaking = ttsPlaying || !!ttsAudio;
   const startsWake = w && norm.startsWith(w);   // wake word must START the utterance to count as an address
 
   // Gate: while asleep or speaking, ignore anything not addressed to us — except a bare stop word, which halts speech.
@@ -350,7 +404,21 @@ document.addEventListener('keyup', e => { if (e.code === 'Space') stopPTT(); });
 $('#stop').onclick = stopSpeak;
 $('#send').onclick = () => { const t = $('#text').value; $('#text').value = ''; perf = {}; send(t); };
 $('#text').addEventListener('keydown', e => { if (e.key === 'Enter') $('#send').click(); });
-$('#model').onchange = () => saveSettings({ model: $('#model').value });
+$('#model').onchange = async () => { await saveSettings({ model: $('#model').value }); warmModel(); };
+
+async function warmModel() {   // preload the selected model (llama-swap) so the first real turn has low TTFT
+  const m = $('#model').value;
+  if (!m) return;
+  const prev = status.textContent;
+  status.textContent = `warming ${m}…`;
+  const t0 = performance.now();
+  const r = await (await fetch('/test_llm', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model: m }),
+  })).json();
+  status.textContent = r.ok ? '' : '⚠ ' + r.detail;
+  if (r.ok) console.log(`[warm] ${m} ready in ${Math.round(performance.now() - t0)}ms`);
+  if ($('#mode').value === 'vad') wakeStatus(); else if (status.textContent === '') status.textContent = prev === `warming ${m}…` ? '' : prev;
+}
 
 // --- settings ---
 $('#gear').onclick = () => {
@@ -409,6 +477,7 @@ async function init() {
   $('#s_timeout').value = cfg.wake_timeout;
   $('#s_system').value = cfg.system_prompt;
   await Promise.all([loadModels(), loadVoices(), loadAck()]);
+  warmModel();   // preload default model so the first turn isn't paying model-load time
 }
 init();
 </script>
