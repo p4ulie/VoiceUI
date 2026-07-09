@@ -29,7 +29,7 @@
   #status { color: #888; font-size: .85rem; min-height: 1.2em; }
   #settings { display: none; border: 1px solid #8884; border-radius: .6rem; padding: 1rem; margin-bottom: 1rem; }
   #settings label { display: block; margin: .5rem 0; }
-  #settings input, #settings select { width: 100%; padding: .4rem; border-radius: .4rem; border: 1px solid #8888; font: inherit; box-sizing: border-box; }
+  #settings input, #settings select, #settings textarea { width: 100%; padding: .4rem; border-radius: .4rem; border: 1px solid #8888; font: inherit; box-sizing: border-box; }
   #settings .row { display: flex; gap: 1rem; }
   #settings .row > label { flex: 1; }
 </style>
@@ -71,6 +71,8 @@
   </div>
   <label><input type="checkbox" id="s_keep"> Keep listening until stop word (ignore sleep timeout)</label>
   <label><input type="checkbox" id="s_barge"> Interrupt when I start talking (barge-in without wake word; use headphones)</label>
+  <label>Personal vocabulary — biases STT (names, jargon) <input id="s_hotwords" placeholder="Antalik, Dataiza, kubectl"></label>
+  <label>Corrections — one per line, <code>heard = meant</code> <textarea id="s_corrections" rows="3" placeholder="data iza = Dataiza"></textarea></label>
   <label>System prompt <input id="s_system" placeholder="(none)"></label>
   <button id="s_save">Save</button>
   <span id="s_status" style="color:#888;font-size:.85rem"></span>
@@ -489,6 +491,8 @@ $('#s_save').onclick = async () => {
     wake_timeout: Number($('#s_timeout').value),
     keep_listening: $('#s_keep').checked,
     barge_on_speech: $('#s_barge').checked,
+    hotwords: $('#s_hotwords').value,
+    corrections: $('#s_corrections').value,
     system_prompt: $('#s_system').value,
   });
   await loadModels();                          // URL/token may have changed
@@ -515,6 +519,8 @@ async function init() {
   $('#s_timeout').value = cfg.wake_timeout;
   $('#s_keep').checked = cfg.keep_listening;
   $('#s_barge').checked = cfg.barge_on_speech;
+  $('#s_hotwords').value = cfg.hotwords;
+  $('#s_corrections').value = cfg.corrections;
   $('#s_system').value = cfg.system_prompt;
   await Promise.all([loadModels(), loadVoices(), loadAck()]);
   warmModel();   // preload default model so the first turn isn't paying model-load time

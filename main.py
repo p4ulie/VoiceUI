@@ -9,6 +9,7 @@ import glob
 import io
 import json
 import os
+import re
 import time
 import wave
 
@@ -28,6 +29,8 @@ DEFAULTS = {
     "model": os.getenv("MODEL", ""),
     "whisper_model": os.getenv("WHISPER_MODEL", "small"),
     "whisper_compute": os.getenv("WHISPER_COMPUTE", "int8"),
+    "hotwords": "",       # personal vocabulary to bias STT (names, jargon)
+    "corrections": "",    # one per line, "heard = meant", applied after transcription
     "piper_voice": os.getenv("PIPER_VOICE", "en_US-lessac-medium.onnx"),
     "wake_word": os.getenv("WAKE_WORD", "computer"),
     "stop_word": os.getenv("STOP_WORD", "stop"),
@@ -82,10 +85,25 @@ def synth_wav(text: str) -> bytes:
     return buf.getvalue()
 
 
+def apply_corrections(text: str) -> str:
+    # personal STT correction memory: whole-word, case-insensitive "heard -> meant".
+    # ponytail: naive per-line regex, fine for a hand-curated list; revisit if it grows huge.
+    for line in SETTINGS.get("corrections", "").splitlines():
+        line = line.strip()
+        sep = "->" if "->" in line else ("=" if "=" in line else None)
+        if not sep:
+            continue
+        heard, meant = (p.strip() for p in line.split(sep, 1))
+        if heard:
+            text = re.sub(rf"\b{re.escape(heard)}\b", meant, text, flags=re.IGNORECASE)
+    return text
+
+
 def transcribe(audio: bytes) -> str:
     # faster-whisper decodes webm/opus/wav via bundled PyAV — no system ffmpeg needed.
-    segments, _ = stt_model().transcribe(io.BytesIO(audio), beam_size=1)
-    return "".join(s.text for s in segments).strip()
+    hotwords = SETTINGS.get("hotwords", "").strip() or None      # bias decoding toward your vocabulary
+    segments, _ = stt_model().transcribe(io.BytesIO(audio), beam_size=1, hotwords=hotwords)
+    return apply_corrections("".join(s.text for s in segments).strip())
 
 
 @app.get("/")
