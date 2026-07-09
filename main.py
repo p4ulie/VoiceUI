@@ -33,6 +33,7 @@ DEFAULTS = {
     "stop_word": os.getenv("STOP_WORD", "stop"),
     "wake_timeout": int(os.getenv("WAKE_TIMEOUT", "30")),
     "keep_listening": os.getenv("KEEP_LISTENING", "") == "1",
+    "barge_on_speech": os.getenv("BARGE_ON_SPEECH", "") == "1",
     "auto_tts": True,
     "system_prompt": os.getenv("SYSTEM_PROMPT", ""),
 }

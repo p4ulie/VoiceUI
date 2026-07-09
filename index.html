@@ -66,6 +66,7 @@
     <label>Sleep after (seconds) <input id="s_timeout" type="number" min="0"></label>
   </div>
   <label><input type="checkbox" id="s_keep"> Keep listening until stop word (ignore sleep timeout)</label>
+  <label><input type="checkbox" id="s_barge"> Interrupt when I start talking (barge-in without wake word; use headphones)</label>
   <label>System prompt <input id="s_system" placeholder="(none)"></label>
   <button id="s_save">Save</button>
   <span id="s_status" style="color:#888;font-size:.85rem"></span>
@@ -303,7 +304,8 @@ function wakeStatus() {
   const w = (cfg.wake_word || '').trim(), sw = (cfg.stop_word || '').trim();
   if (!w) { status.textContent = 'listening…'; return; }
   if (!awake) { status.textContent = `😴 say “${w}” to wake`; return; }
-  status.textContent = cfg.keep_listening && sw ? `🟢 listening — say “${sw}” to end` : '🟢 awake — listening';
+  status.textContent = cfg.barge_on_speech ? '🟢 listening — just talk to interrupt'
+    : cfg.keep_listening && sw ? `🟢 listening — say “${sw}” to end` : '🟢 awake — listening';
 }
 function goSleep() { awake = false; clearTimeout(wakeTimer); wakeStatus(); endTone(); }  // end session + confirm
 function armSleep() {
@@ -324,11 +326,13 @@ async function onVadSpeech(blob) {
   const speaking = ttsPlaying || !!ttsAudio;
   const startsWake = w && norm.startsWith(w);   // wake word must START the utterance to count as an address
 
-  // Gate: while asleep or speaking, ignore anything not addressed to us — except a bare stop word, which halts speech.
+  // Gate: while asleep or speaking, ignore anything not addressed to us — except a bare stop
+  // word (halts speech), or natural barge-in: when awake + enabled, just talking interrupts.
   if (w && (speaking || !awake) && !startsWake) {
-    if (sw && norm === sw && speaking) stopSpeak();
-    if (!speaking) wakeStatus();
-    return;
+    if (sw && norm === sw && speaking) { stopSpeak(); return; }
+    const barge = speaking && awake && cfg.barge_on_speech && norm.length >= 4;  // substantive, not echo blip
+    if (!barge) { if (!speaking) wakeStatus(); return; }
+    stopSpeak();                       // interrupt current speech; fall through to send() below (which also cancels /chat)
   }
 
   const justWoke = startsWake && (!awake || speaking);
@@ -478,6 +482,7 @@ $('#s_save').onclick = async () => {
     stop_word: $('#s_stop').value,
     wake_timeout: Number($('#s_timeout').value),
     keep_listening: $('#s_keep').checked,
+    barge_on_speech: $('#s_barge').checked,
     system_prompt: $('#s_system').value,
   });
   await loadModels();                          // URL/token may have changed
@@ -503,6 +508,7 @@ async function init() {
   $('#s_stop').value = cfg.stop_word;
   $('#s_timeout').value = cfg.wake_timeout;
   $('#s_keep').checked = cfg.keep_listening;
+  $('#s_barge').checked = cfg.barge_on_speech;
   $('#s_system').value = cfg.system_prompt;
   await Promise.all([loadModels(), loadVoices(), loadAck()]);
   warmModel();   // preload default model so the first turn isn't paying model-load time
